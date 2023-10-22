@@ -8,3 +8,5 @@ target = "armv7-unknown-linux-gnueabihf"
 
 [dependencies]
 rppal = "0.14.1"
+bluer = "0.16.1"
+bluer-tools = "0.16.1"

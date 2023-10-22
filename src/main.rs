@@ -1,43 +1,148 @@
-use std::error::Error;
-use std::sync::mpsc::channel;
-use std::thread;
-use std::time::Duration;
+use bluer::{
+    adv::Advertisement,
+    gatt::{
+        local::{
+            characteristic_control, service_control, Application, Characteristic, CharacteristicControlEvent,
+            CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteMethod,
+            Service,
+        },
+        CharacteristicReader, CharacteristicWriter,
+    },
+};
+use futures::{future, pin_mut, StreamExt};
+use std::{collections::BTreeMap, time::Duration};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    time::{interval, sleep},
+};
 
-use rppal::gpio::Gpio;
+include!("gatt.inc");
 
 // Gpio uses BCM pin numbering. BCM GPIO 23 is tied to physical pin 16.
 const GPIO_LED: u8 = 23;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Construct an asynchronous channel. Sender can be cloned if it needs to be shared with other threads.
-    let (sender, receiver) = channel();
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> bluer::Result<()> {
+    env_logger::init();
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    adapter.set_powered(true).await?;
 
-    let led_thread = thread::spawn(move || -> Result<(), rppal::gpio::Error> {
-        // Retrieve the GPIO pin and configure it as an output.
-        let mut pin = Gpio::new()?.get(GPIO_LED)?.into_output_low();
+    println!("Advertising on Bluetooth adapter {} with address {}", adapter.name(), adapter.address().await?);
+    let mut manufacturer_data = BTreeMap::new();
+    manufacturer_data.insert(MANUFACTURER_ID, vec![0x21, 0x22, 0x23, 0x24]);
+    let le_advertisement = Advertisement {
+        service_uuids: vec![SERVICE_UUID].into_iter().collect(),
+        manufacturer_data,
+        discoverable: Some(true),
+        local_name: Some("gatt_server".to_string()),
+        ..Default::default()
+    };
+    let adv_handle = adapter.advertise(le_advertisement).await?;
 
-        // Wait for an incoming message. Loop until a None is received.
-        while let Some(count) = receiver.recv().unwrap() {
-            println!("Blinking the LED {} times.", count);
-            for _ in 0u8..count {
-                pin.set_high();
-                thread::sleep(Duration::from_millis(250));
-                pin.set_low();
-                thread::sleep(Duration::from_millis(250));
+    println!("Serving GATT service on Bluetooth adapter {}", adapter.name());
+    let (service_control, service_handle) = service_control();
+    let (char_control, char_handle) = characteristic_control();
+    let app = Application {
+        services: vec![Service {
+            uuid: SERVICE_UUID,
+            primary: true,
+            characteristics: vec![Characteristic {
+                uuid: CHARACTERISTIC_UUID,
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    write_without_response: true,
+                    method: CharacteristicWriteMethod::Io,
+                    ..Default::default()
+                }),
+                notify: Some(CharacteristicNotify {
+                    notify: true,
+                    method: CharacteristicNotifyMethod::Io,
+                    ..Default::default()
+                }),
+                control_handle: char_handle,
+                ..Default::default()
+            }],
+            control_handle: service_handle,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let app_handle = adapter.serve_gatt_application(app).await?;
+
+    println!("Service handle is 0x{:x}", service_control.handle()?);
+    println!("Characteristic handle is 0x{:x}", char_control.handle()?);
+
+    println!("Service ready. Press enter to quit.");
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+
+    let mut value: Vec<u8> = vec![0x10, 0x01, 0x01, 0x10];
+    let mut read_buf = Vec::new();
+    let mut reader_opt: Option<CharacteristicReader> = None;
+    let mut writer_opt: Option<CharacteristicWriter> = None;
+    let mut interval = interval(Duration::from_secs(1));
+    pin_mut!(char_control);
+
+    loop {
+        tokio::select! {
+            _ = lines.next_line() => break,
+            evt = char_control.next() => {
+                match evt {
+                    Some(CharacteristicControlEvent::Write(req)) => {
+                        println!("Accepting write event with MTU {} from {}", req.mtu(), req.device_address());
+                        read_buf = vec![0; req.mtu()];
+                        reader_opt = Some(req.accept()?);
+                    },
+                    Some(CharacteristicControlEvent::Notify(notifier)) => {
+                        println!("Accepting notify request event with MTU {} from {}", notifier.mtu(), notifier.device_address());
+                        writer_opt = Some(notifier);
+                    },
+                    None => break,
+                }
+            }
+            _ = interval.tick() => {
+                println!("Decrementing each element by one");
+                for v in &mut *value {
+                    *v = v.saturating_sub(1);
+                }
+                println!("Value is {:x?}", &value);
+                if let Some(writer) = writer_opt.as_mut() {
+                    println!("Notifying with value {:x?}", &value);
+                    if let Err(err) = writer.write(&value).await {
+                        println!("Notification stream error: {}", &err);
+                        writer_opt = None;
+                    }
+                }
+            }
+            read_res = async {
+                match &mut reader_opt {
+                    Some(reader) => reader.read(&mut read_buf).await,
+                    None => future::pending().await,
+                }
+            } => {
+                match read_res {
+                    Ok(0) => {
+                        println!("Write stream ended");
+                        reader_opt = None;
+                    }
+                    Ok(n) => {
+                        value = read_buf[0..n].to_vec();
+                        println!("Write request with {} bytes: {:x?}", n, &value);
+                    }
+                    Err(err) => {
+                        println!("Write stream error: {}", &err);
+                        reader_opt = None;
+                    }
+                }
             }
         }
+    }
 
-        Ok(())
-    });
-
-    // Request 3 blinks. We're using an asynchronous channel, so send() returns immediately.
-    sender.send(Some(3))?;
-
-    // Sending None terminates the while loop on the LED thread.
-    sender.send(None)?;
-
-    // Wait until the LED thread has finished executing.
-    led_thread.join().unwrap()?;
+    println!("Removing service and advertisement");
+    drop(app_handle);
+    drop(adv_handle);
+    sleep(Duration::from_secs(1)).await;
 
     Ok(())
 }
